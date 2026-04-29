@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Install the locally-built Zed fork to ~/.local/zed-fork.app/ and register
+# a separate "Zed (Fork)" desktop entry so launchers (walker/rofi/etc.) can
+# distinguish it from any system-installed upstream Zed.
+#
+# This intentionally:
+#   * Lives in a parallel app dir (~/.local/zed-fork.app) so it doesn't
+#     overwrite ~/.local/zed.app from the upstream installer.
+#   * Names the CLI shim `zed-fork` so `zed` keeps pointing at upstream.
+#   * Uses APP_ID dev.zed.Zed-Fork so the desktop entry is unambiguous.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+target_triple="${TARGET_TRIPLE:-$(rustc --version --verbose | awk '/^host:/{print $2}')}"
+target_dir="${CARGO_TARGET_DIR:-target}"
+
+zed_bin="${target_dir}/${target_triple}/release/zed"
+cli_bin="${target_dir}/${target_triple}/release/cli"
+
+if [[ ! -x "$zed_bin" || ! -x "$cli_bin" ]]; then
+    echo "error: missing release binaries" >&2
+    echo "  expected: $zed_bin" >&2
+    echo "  expected: $cli_bin" >&2
+    echo "  run: cargo build --release --target $target_triple --package zed --package cli" >&2
+    exit 1
+fi
+
+prefix="${HOME}/.local"
+app_dir="${prefix}/zed-fork.app"
+
+echo ">> installing to ${app_dir}"
+rm -rf "${app_dir}"
+mkdir -p "${app_dir}/bin" "${app_dir}/libexec" "${app_dir}/lib" \
+         "${app_dir}/share/applications" \
+         "${app_dir}/share/icons/hicolor/512x512/apps" \
+         "${app_dir}/share/icons/hicolor/1024x1024/apps"
+
+cp "$zed_bin" "${app_dir}/libexec/zed-editor"
+cp "$cli_bin" "${app_dir}/bin/zed"
+
+# Strip debug symbols to keep the install size sane (mirrors
+# script/bundle-linux). llvm-objcopy is preferred because GNU objcopy
+# on older distros doesn't understand CREL sections from newer LLVM.
+if command -v llvm-objcopy >/dev/null 2>&1; then
+    llvm-objcopy --strip-debug "${app_dir}/libexec/zed-editor"
+    llvm-objcopy --strip-debug "${app_dir}/bin/zed"
+elif command -v strip >/dev/null 2>&1; then
+    strip --strip-debug "${app_dir}/libexec/zed-editor"
+    strip --strip-debug "${app_dir}/bin/zed"
+fi
+
+# Bundle non-system shared libs the editor links against, mirroring
+# script/bundle-linux. The editor finds them via rpath=$ORIGIN/../lib that
+# we set via RUSTFLAGS at build time.
+echo ">> bundling dynamic libraries"
+mapfile -t libs < <(
+    ldd "$zed_bin" \
+        | awk '{print $3}' \
+        | grep -v '^$' \
+        | grep -v '\<\(libstdc++.so\|libc.so\|libgcc_s.so\|libm.so\|libpthread.so\|libdl.so\|libasound.so\)' \
+        || true
+)
+if [[ ${#libs[@]} -gt 0 ]]; then
+    cp -L "${libs[@]}" "${app_dir}/lib/"
+fi
+
+# Icons (use the dev-channel icon to make it visually distinct).
+cp crates/zed/resources/app-icon-dev.png \
+   "${app_dir}/share/icons/hicolor/512x512/apps/zed-fork.png"
+cp crates/zed/resources/app-icon-dev@2x.png \
+   "${app_dir}/share/icons/hicolor/1024x1024/apps/zed-fork.png"
+
+# Desktop entry. We embed the fork commit short SHA + branch into the
+# Comment field so you can tell at a glance which build is registered.
+commit_short="$(git rev-parse --short HEAD)"
+branch="$(git rev-parse --abbrev-ref HEAD)"
+date_stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+desktop_path="${app_dir}/share/applications/dev.zed.Zed-Fork.desktop"
+cat > "${desktop_path}" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Zed (Fork)
+GenericName=Text Editor
+Comment=shuv1337/zed @ ${branch} ${commit_short} (built ${date_stamp})
+TryExec=${app_dir}/bin/zed
+StartupNotify=true
+StartupWMClass=dev.zed.Zed-Dev
+Exec=${app_dir}/bin/zed %U
+Icon=${app_dir}/share/icons/hicolor/512x512/apps/zed-fork.png
+Categories=Utility;TextEditor;Development;IDE;
+Keywords=zed;fork;
+Actions=NewWorkspace;
+
+[Desktop Action NewWorkspace]
+Exec=${app_dir}/bin/zed --new %U
+Name=Open a new workspace
+EOF
+chmod +x "${desktop_path}"
+
+# Mirror the desktop file into the user's XDG applications dir so launchers
+# (walker, rofi, gnome-shell, etc.) pick it up without extra config.
+xdg_apps="${HOME}/.local/share/applications"
+mkdir -p "${xdg_apps}"
+cp -f "${desktop_path}" "${xdg_apps}/dev.zed.Zed-Fork.desktop"
+
+# CLI shim: deliberately named `zed-fork` so it doesn't clobber the
+# system-installed upstream `zed`.
+mkdir -p "${prefix}/bin"
+ln -sf "${app_dir}/bin/zed" "${prefix}/bin/zed-fork"
+
+# Refresh the desktop database & icon cache so launchers see the entry.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "${xdg_apps}" || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache --force --quiet "${app_dir}/share/icons/hicolor" || true
+fi
+
+echo
+echo "Installed:"
+echo "  app dir       : ${app_dir}"
+echo "  CLI shim      : ${prefix}/bin/zed-fork  (-> ${app_dir}/bin/zed)"
+echo "  desktop entry : ${xdg_apps}/dev.zed.Zed-Fork.desktop"
+echo
+echo "Launch from terminal: zed-fork"
+echo "Launch from walker  : search 'Zed (Fork)'"
