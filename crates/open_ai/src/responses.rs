@@ -9,10 +9,14 @@ use crate::{ReasoningEffort, RequestError, Role, ToolChoice};
 #[derive(Serialize, Debug)]
 pub struct Request {
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<ResponseInputItem>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,6 +313,38 @@ pub struct ResponseFunctionToolCall {
     pub status: Option<String>,
 }
 
+pub fn parse_responses_sse_stream(body: AsyncBody) -> BoxStream<'static, Result<StreamEvent>> {
+    let reader = BufReader::new(body);
+    reader
+        .lines()
+        .filter_map(|line| async move {
+            match line {
+                Ok(line) => {
+                    let line = line
+                        .strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"))?;
+                    if line == "[DONE]" || line.is_empty() {
+                        None
+                    } else {
+                        match serde_json::from_str::<StreamEvent>(line) {
+                            Ok(event) => Some(Ok(event)),
+                            Err(error) => {
+                                log::error!(
+                                    "Failed to parse OpenAI responses stream event: `{}`\nResponse: `{}`",
+                                    error,
+                                    line,
+                                );
+                                Some(Err(anyhow!(error)))
+                            }
+                        }
+                    }
+                }
+                Err(error) => Some(Err(anyhow!(error))),
+            }
+        })
+        .boxed()
+}
+
 pub async fn stream_response(
     client: &dyn HttpClient,
     provider_name: &str,
@@ -333,35 +369,7 @@ pub async fn stream_response(
     let mut response = client.send(request).await?;
     if response.status().is_success() {
         if is_streaming {
-            let reader = BufReader::new(response.into_body());
-            Ok(reader
-                .lines()
-                .filter_map(|line| async move {
-                    match line {
-                        Ok(line) => {
-                            let line = line
-                                .strip_prefix("data: ")
-                                .or_else(|| line.strip_prefix("data:"))?;
-                            if line == "[DONE]" || line.is_empty() {
-                                None
-                            } else {
-                                match serde_json::from_str::<StreamEvent>(line) {
-                                    Ok(event) => Some(Ok(event)),
-                                    Err(error) => {
-                                        log::error!(
-                                            "Failed to parse OpenAI responses stream event: `{}`\nResponse: `{}`",
-                                            error,
-                                            line,
-                                        );
-                                        Some(Err(anyhow!(error)))
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => Some(Err(anyhow!(error))),
-                    }
-                })
-                .boxed())
+            Ok(parse_responses_sse_stream(response.into_body()))
         } else {
             let mut body = String::new();
             response
